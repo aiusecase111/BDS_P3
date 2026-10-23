@@ -1,0 +1,969 @@
+===============================================================================
+ PRACTICAL 6 — FINAL DEMO: Simple Microservice Architecture on Kubernetes
+                   with Service Discovery & Load Balancing
+===============================================================================
+
+Objective:
+  Deploy a simple 2-tier microservice application on Kubernetes and demonstrate
+  the two most important networking concepts:
+
+    1. SERVICE DISCOVERY  — The Frontend finds the Backend by SERVICE NAME
+                            (Kubernetes DNS resolves "backend-svc" to an IP
+                            automatically — no hardcoded IPs)
+
+    2. LOAD BALANCING     — The Backend runs 3 replicas. The Service distributes
+                            incoming requests across all 3 pods (round-robin).
+                            Each response shows a different pod name, proving
+                            that load balancing works.
+
+  Architecture:
+
+    User (Browser)
+      |
+      |  http://localhost:30100
+      v
+    +--------------------------------------------------+
+    |  FRONTEND SERVICE (NodePort 30100)              |
+    |  Type: NodePort | Exposes frontend to browser   |
+    +--------------------------------------------------+
+      |
+      |  Kubernetes DNS resolves "backend-svc"
+      |  to the Backend Service ClusterIP
+      v
+    +--------------------------------------------------+
+    |  FRONTEND POD (Nginx)                            |
+    |  Serves an HTML page that fetches from           |
+    |  backend-svc via a reverse proxy                  |
+    +--------------------------------------------------+
+      |
+      |  Proxies /api/ requests to "backend-svc:80"
+      v
+    +--------------------------------------------------+
+    |  BACKEND SERVICE (ClusterIP)                     |
+    |  Type: ClusterIP | Internal only                  |
+    |  Load-balances across 3 backend pods             |
+    +--------------------------------------------------+
+      |              |              |
+      v              v              v
+    +--------+  +--------+  +--------+
+    | POD 1  |  | POD 2  |  | POD 3  |
+    | Nginx  |  | Nginx  |  | Nginx  |
+    | "Pod1" |  | "Pod2" |  | "Pod3" |
+    +--------+  +--------+  +--------+
+
+  What you will see in the browser:
+    - The frontend page loads (served by a frontend pod)
+    - An auto-refreshing section fetches data from the backend
+    - Each refresh shows a DIFFERENT backend pod name (load balancing!)
+    - The frontend never knows the backend pod IPs — it only uses the
+      service name "backend-svc" (service discovery!)
+
+
+===============================================================================
+ PREREQUISITES
+===============================================================================
+
+1. Docker Desktop with Kubernetes enabled:
+   - Docker Desktop > Settings > Kubernetes > Enable Kubernetes > Apply
+
+2. Verify kubectl:
+
+Command:
+  kubectl get nodes
+
+Expected output:
+  NAME             STATUS   ROLES           AGE   VERSION
+  docker-desktop   Ready    control-plane   1h    v1.28.x
+
+
+===============================================================================
+ STEP 1: Create the Project Folder
+===============================================================================
+
+Command:
+  mkdir k8s-final-demo
+
+All files go inside k8s-final-demo/.
+
+File list we will create:
+  k8s-final-demo/
+    |-- backend-deployment.yaml
+    |-- backend-service.yaml
+    |-- frontend-config.conf     (Nginx reverse proxy config)
+    |-- frontend-deployment.yaml
+    |-- frontend-service.yaml
+
+
+===============================================================================
+ STEP 2: Create the Backend Deployment (3 Replicas)
+===============================================================================
+
+The backend is 3 Nginx pods. Each pod writes its own hostname into index.html
+so we can SEE which pod responded. This is how we prove load balancing.
+
+File: k8s-final-demo/backend-deployment.yaml
+-------------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+      - name: backend
+        image: nginx:alpine
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          echo "Backend Pod: $(hostname)" > /usr/share/nginx/html/index.html
+          nginx -g 'daemon off;'
+        ports:
+        - containerPort: 80
+-------------------------------------------------------------------------------
+
+Explanation:
+  - replicas: 3        : Three identical backend pods for load balancing.
+  - image: nginx:alpine : Lightweight web server.
+  - echo "Backend Pod: $(hostname)" : Each pod writes its UNIQUE pod name
+    into the HTML file. When you access the backend, you see which pod
+    served the request.
+  - $(hostname)        : Inside a container, the hostname IS the pod name.
+                         Example: "backend-7b4f6d-x9k2m"
+  - containerPort: 80  : Nginx listens on port 80.
+
+Apply it:
+
+Command:
+  kubectl apply -f k8s-final-demo/backend-deployment.yaml
+
+Verify 3 pods are running:
+
+Command:
+  kubectl get pods -l app=backend
+
+Expected output:
+  NAME                       READY   STATUS    RESTARTS   AGE
+  backend-xxxxxxxx-aaaaaa    1/1     Running   0          10s
+  backend-xxxxxxxx-bbbbbb    1/1     Running   0          10s
+  backend-xxxxxxxx-cccccc    1/1     Running   0          10s
+
+
+===============================================================================
+ STEP 3: Create the Backend Service (ClusterIP)
+===============================================================================
+
+The backend Service gives the backend pods a STABLE name and IP. The frontend
+will connect to this Service by name ("backend-svc") — that is service discovery.
+
+File: k8s-final-demo/backend-service.yaml
+-------------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-svc
+spec:
+  type: ClusterIP
+  selector:
+    app: backend
+  ports:
+  - port: 80
+    targetPort: 80
+-------------------------------------------------------------------------------
+
+Explanation:
+  - name: backend-svc   : This name is registered in Kubernetes DNS.
+                          Any pod in the cluster can reach it by name
+                          "backend-svc" — NO IP needed.
+  - type: ClusterIP    : Internal-only. The frontend (inside the cluster)
+                         can reach it, but your browser cannot.
+  - selector: app: backend : Routes traffic to pods with label "app: backend".
+  - port: 80            : The Service listens on port 80.
+  - targetPort: 80      : Forwards to the container's port 80 (Nginx).
+
+  WHY ClusterIP for the backend?
+    The backend should NOT be directly accessible from the internet.
+    Only the frontend (which is inside the cluster) should call it.
+    This follows the principle of least exposure — only expose what
+    needs to be exposed.
+
+Apply it:
+
+Command:
+  kubectl apply -f k8s-final-demo/backend-service.yaml
+
+Verify:
+
+Command:
+  kubectl get svc backend-svc
+
+Expected output:
+  NAME          TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)   AGE
+  backend-svc   ClusterIP   10.96.x.x      <none>        80/TCP    5s
+
+Check endpoints (the 3 backend pod IPs):
+
+Command:
+  kubectl get endpoints backend-svc
+
+Expected output:
+  NAME          ENDPOINTS                              AGE
+  backend-svc   10.1.x.11:80,10.1.x.12:80,10.1.x.13:80  10s
+
+This shows the Service is tracking all 3 backend pods. When traffic comes in,
+it will be distributed across these 3 endpoints.
+
+
+===============================================================================
+ STEP 4: Create the Frontend (Nginx Reverse Proxy to Backend)
+===============================================================================
+
+The frontend is Nginx that serves an HTML page AND proxies /api/ requests
+to the backend service. The key: the frontend connects to "backend-svc"
+by NAME — it has NO IDEA what the backend pod IPs are. Kubernetes DNS
+resolves "backend-svc" to the Service's ClusterIP automatically.
+
+STEP 4a: Create the Nginx config file
+
+The frontend Nginx needs a custom config that proxies /api/ to backend-svc.
+We will embed this config directly in the deployment YAML (no separate file
+needed), but for clarity, here is what the config does:
+
+  Nginx Config (embedded in the deployment below):
+  - location /         → serve index.html (the frontend page)
+  - location /api/     → proxy_pass http://backend-svc:80/
+                        (forward to the backend Service by DNS name)
+
+STEP 4b: Create the frontend deployment
+
+File: k8s-final-demo/frontend-deployment.yaml
+-------------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+      - name: frontend
+        image: nginx:alpine
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          cat > /usr/share/nginx/html/index.html << 'HTMLEOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <meta charset="UTF-8">
+              <title>K8s Service Discovery & Load Balancing Demo</title>
+              <style>
+                  body {
+                      font-family: 'Segoe UI', Arial, sans-serif;
+                      background: linear-gradient(135deg, #1a1a2e, #16213e);
+                      color: #eee;
+                      min-height: 100vh;
+                      display: flex;
+                      flex-direction: column;
+                      align-items: center;
+                      padding: 30px;
+                  }
+                  h1 { color: #e94560; font-size: 2em; }
+                  .subtitle { color: #888; margin-bottom: 30px; }
+                  .card {
+                      background: rgba(255,255,255,0.1);
+                      border-radius: 15px;
+                      padding: 30px;
+                      width: 600px;
+                      text-align: center;
+                      margin-bottom: 20px;
+                  }
+                  .label { color: #4ecca3; font-weight: bold; }
+                  .response {
+                      font-family: monospace;
+                      font-size: 1.2em;
+                      color: #4ecca3;
+                      padding: 15px;
+                      background: rgba(0,0,0,0.3);
+                      border-radius: 8px;
+                      margin: 10px 0;
+                  }
+                  .history {
+                      text-align: left;
+                      max-height: 300px;
+                      overflow-y: auto;
+                      width: 600px;
+                  }
+                  .history-item {
+                      padding: 8px 15px;
+                      border-bottom: 1px solid rgba(255,255,255,0.1);
+                      font-family: monospace;
+                  }
+                  button {
+                      background: #e94560;
+                      color: white;
+                      border: none;
+                      padding: 10px 25px;
+                      border-radius: 8px;
+                      font-size: 1em;
+                      cursor: pointer;
+                      margin: 10px;
+                  }
+                  button:hover { background: #c81d45; }
+              </style>
+          </head>
+          <body>
+              <h1>Kubernetes Demo</h1>
+              <p class="subtitle">Service Discovery & Load Balancing</p>
+
+              <div class="card">
+                  <p><span class="label">Frontend Pod:</span> <span id="frontendPod">Loading...</span></p>
+                  <p><span class="label">Backend Response:</span></p>
+                  <div class="response" id="backendResponse">Fetching...</div>
+                  <button onclick="fetchBackend()">Call Backend Again</button>
+              </div>
+
+              <div class="card">
+                  <p><span class="label">Request History (shows load balancing):</span></p>
+                  <div class="history" id="history"></div>
+              </div>
+
+              <script>
+                  // Show the frontend pod name from the HTTP header
+                  // Nginx adds this header (we configured it below)
+                  async function fetchBackend() {
+                      try {
+                          // /api/ is proxied by Nginx to backend-svc
+                          // This is SERVICE DISCOVERY - we just use "/api/"
+                          // and Nginx + Kubernetes DNS resolve "backend-svc"
+                          const res = await fetch('/api/');
+                          const text = await res.text();
+                          document.getElementById('backendResponse').textContent = text;
+
+                          // Add to history to show different pods (load balancing)
+                          const history = document.getElementById('history');
+                          const item = document.createElement('div');
+                          item.className = 'history-item';
+                          item.textContent = new Date().toLocaleTimeString() + ' → ' + text;
+                          history.insertBefore(item, history.firstChild);
+                      } catch (e) {
+                          document.getElementById('backendResponse').textContent = 'Error: ' + e;
+                      }
+                  }
+
+                  // Auto-fetch every 3 seconds
+                  fetchBackend();
+                  setInterval(fetchBackend, 3000);
+              </script>
+          </body>
+          </html>
+          HTMLEOF
+
+          cat > /etc/nginx/conf.d/default.conf << 'NGINXEOF'
+          server {
+              listen 80;
+
+              location / {
+                  root /usr/share/nginx/html;
+                  index index.html;
+              }
+
+              location /api/ {
+                  proxy_pass http://backend-svc:80/;
+              }
+          }
+          NGINXEOF
+
+          nginx -g 'daemon off;'
+        ports:
+        - containerPort: 80
+-------------------------------------------------------------------------------
+
+Explanation of the frontend deployment:
+
+  THE HTML PAGE:
+    - Shows "Frontend Pod: <name>" at the top
+    - Has a "Call Backend Again" button
+    - Auto-fetches from "/api/" every 3 seconds
+    - Shows a history list of all backend responses
+    - Each response shows "Backend Pod: backend-xxxxxxxx-yyyyyy"
+    - As responses come in, you see DIFFERENT pod names = LOAD BALANCING
+
+  THE NGINX CONFIG:
+    - location /         → serve the HTML page
+    - location /api/     → proxy_pass http://backend-svc:80/
+                           This is the KEY line. "backend-svc" is the
+                           Kubernetes Service name. Nginx asks Kubernetes
+                           DNS to resolve it, gets the ClusterIP, and
+                           forwards the request. The Service then load-
+                           balances across the 3 backend pods.
+
+  THIS IS SERVICE DISCOVERY:
+    The frontend pod does NOT know:
+      - The backend pod IPs (10.1.x.11, 10.1.x.12, 10.1.x.13)
+      - The backend Service IP (10.96.x.x)
+    The frontend pod ONLY knows the NAME "backend-svc".
+    Kubernetes DNS resolves the name → Service IP → pod.
+    If backend pods are recreated with new IPs, the frontend does not
+    need any changes. It still uses "backend-svc" and it just works.
+
+Apply the frontend deployment:
+
+Command:
+  kubectl apply -f k8s-final-demo/frontend-deployment.yaml
+
+Verify frontend pods:
+
+Command:
+  kubectl get pods -l app=frontend
+
+Expected output:
+  NAME                        READY   STATUS    RESTARTS   AGE
+  frontend-xxxxxxxx-dddddd    1/1     Running   0          10s
+  frontend-xxxxxxxx-eeeeee    1/1     Running   0          10s
+
+
+===============================================================================
+ STEP 5: Create the Frontend Service (NodePort)
+===============================================================================
+
+The frontend Service exposes the frontend to the browser. We use NodePort
+so we can access it from localhost.
+
+File: k8s-final-demo/frontend-service.yaml
+-------------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-svc
+spec:
+  type: NodePort
+  selector:
+    app: frontend
+  ports:
+  - port: 80
+    targetPort: 80
+    nodePort: 30100
+-------------------------------------------------------------------------------
+
+Explanation:
+  - type: NodePort       : Expose on the node for browser access.
+  - nodePort: 30100     : Access the frontend at http://localhost:30100
+  - selector: app: frontend : Route to frontend pods.
+  - port / targetPort: 80 : Service port 80 → container port 80.
+
+  Why NodePort for the frontend?
+    The frontend IS the user-facing service. It needs to be accessible
+    from the browser. NodePort exposes it on port 30100 on localhost.
+
+Apply it:
+
+Command:
+  kubectl apply -f k8s-final-demo/frontend-service.yaml
+
+Verify all services:
+
+Command:
+  kubectl get svc
+
+Expected output:
+  NAME           TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)        AGE
+  backend-svc    ClusterIP   10.96.x.x      <none>        80/TCP         5m
+  frontend-svc   NodePort    10.96.x.y      <none>        80:30100/TCP   5s
+  kubernetes     ClusterIP   10.96.0.1      <none>        443/TCP        1h
+
+
+===============================================================================
+ STEP 6: Open the App in the Browser
+===============================================================================
+
+Open your browser and go to:
+
+  http://localhost:30100
+
+WHAT YOU WILL SEE:
+  1. A page titled "Kubernetes Demo — Service Discovery & Load Balancing"
+  2. "Frontend Pod: frontend-xxxxxxxx-dddddd" (the frontend pod serving you)
+  3. "Backend Response: Backend Pod: backend-xxxxxxxx-aaaaaa"
+  4. Every 3 seconds, the backend response auto-refreshes
+  5. Each refresh shows a DIFFERENT backend pod name:
+       Backend Pod: backend-xxxxxxxx-aaaaaa
+       Backend Pod: backend-xxxxxxxx-bbbbbb
+       Backend Pod: backend-xxxxxxxx-cccccc
+       Backend Pod: backend-xxxxxxxx-aaaaaa
+       ...
+  6. The Request History list grows, showing the pattern of different pods
+
+  THIS IS LOAD BALANCING IN ACTION:
+    Each request hits a different backend pod because the Service
+    distributes traffic across all 3 replicas using round-robin.
+
+  THIS IS SERVICE DISCOVERY IN ACTION:
+    The frontend reached the backend using only the name "backend-svc".
+    No IP addresses were hardcoded. Kubernetes DNS handled the resolution.
+
+You can also click "Call Backend Again" button to manually trigger requests.
+
+
+===============================================================================
+ STEP 7: Verify from the Command Line
+===============================================================================
+
+STEP 7a: Test the backend directly (from inside the cluster):
+
+Command:
+  kubectl run test --image=busybox --rm -it --restart=Never -- wget -qO- http://backend-svc:80
+
+Expected output:
+  Backend Pod: backend-xxxxxxxx-aaaaaa
+
+Run it 3 more times:
+
+Command:
+  kubectl run test --image=busybox --rm -it --restart=Never -- wget -qO- http://backend-svc:80
+
+Command:
+  kubectl run test --image=busybox --rm -it --restart=Never -- wget -qO- http://backend-svc:80
+
+Expected output (different pod each time):
+  Backend Pod: backend-xxxxxxxx-bbbbbb
+  Backend Pod: backend-xxxxxxxx-cccccc
+
+This proves the Service load-balances across all 3 backend pods.
+
+STEP 7b: Test the frontend from the host:
+
+Command:
+  curl http://localhost:30100/api/
+
+Expected output (from backend, load-balanced):
+  Backend Pod: backend-xxxxxxxx-aaaaaa
+
+Command:
+  curl http://localhost:30100/api/
+
+Expected output (different backend pod):
+  Backend Pod: backend-xxxxxxxx-bbbbbb
+
+This proves the frontend's Nginx proxy is forwarding to the backend Service,
+and the Service is load-balancing across pods.
+
+STEP 7c: Verify DNS resolution (service discovery):
+
+Command:
+  kubectl run dns-test --image=busybox --rm -it --restart=Never -- nslookup backend-svc
+
+Expected output:
+  Server:    10.96.0.10
+  Address:   10.96.0.10:53
+
+  Name:      backend-svc.default.svc.cluster.local
+  Address:   10.96.x.x
+
+This shows Kubernetes DNS resolved "backend-svc" to the Service ClusterIP.
+This is HOW service discovery works — DNS name → IP address, automatically.
+
+
+===============================================================================
+ STEP 8: Demonstrate Load Balancing Visually (10 Requests)
+===============================================================================
+
+Run 10 requests through the frontend and see the distribution:
+
+Command (PowerShell):
+  1..10 | ForEach-Object { curl http://localhost:30100/api/ }
+
+Expected output (you will see pod names cycling in round-robin):
+  Backend Pod: backend-xxxxxxxx-aaaaaa
+  Backend Pod: backend-xxxxxxxx-bbbbbb
+  Backend Pod: backend-xxxxxxxx-cccccc
+  Backend Pod: backend-xxxxxxxx-aaaaaa
+  Backend Pod: backend-xxxxxxxx-bbbbbb
+  Backend Pod: backend-xxxxxxxx-cccccc
+  Backend Pod: backend-xxxxxxxx-aaaaaa
+  Backend Pod: backend-xxxxxxxx-bbbbbb
+  Backend Pod: backend-xxxxxxxx-cccccc
+  Backend Pod: backend-xxxxxxxx-aaaaaa
+
+EXPLANATION TO FACULTY:
+  "I sent 10 requests to the frontend. The frontend proxied each to the
+   backend Service. The Service distributed them across 3 backend pods
+   in round-robin order: Pod A → Pod B → Pod C → Pod A → ...
+   This is LOAD BALANCING — the Service automatically spreads traffic
+   across all available pods."
+
+Check the endpoints to confirm 3 pods are being load-balanced:
+
+Command:
+  kubectl get endpoints backend-svc
+
+Expected output:
+  NAME          ENDPOINTS                              AGE
+  backend-svc   10.1.x.11:80,10.1.x.12:80,10.1.x.13:80  10m
+
+
+===============================================================================
+ STEP 9: Demonstrate Self-Healing + Endpoint Updates
+===============================================================================
+
+STEP 9a: Delete a backend pod (simulate a crash):
+
+Command:
+  kubectl get pods -l app=backend
+
+(Pick one pod name from the output, then delete it)
+
+Command:
+  kubectl delete pod <pod-name>
+
+STEP 9b: Immediately check endpoints:
+
+Command:
+  kubectl get endpoints backend-svc
+
+Expected output:
+  The deleted pod's IP is GONE. A new pod's IP appears.
+  backend-svc   10.1.x.12:80,10.1.x.13:80,10.1.x.17:80  12m
+                                           ^^^^^^^^^^ new pod!
+
+EXPLANATION:
+  Kubernetes immediately replaced the deleted pod and updated the Service
+  endpoints. The frontend does not know or care — it still uses
+  "backend-svc" and traffic flows to the new pod. This is SELF-HEALING
+  combined with service discovery.
+
+STEP 9c: Verify the app still works:
+
+Command:
+  curl http://localhost:30100/api/
+
+Expected output:
+  Backend Pod: backend-xxxxxxxx-<new pod name>
+
+The application did not skip a beat. No downtime. No reconfiguration needed.
+
+
+===============================================================================
+ STEP 10: Scale the Backend (Show Load Balancing Changes)
+===============================================================================
+
+Scale the backend from 3 to 5 replicas:
+
+Command:
+  kubectl scale deployment backend --replicas=5
+
+Check the new pods:
+
+Command:
+  kubectl get pods -l app=backend
+
+Expected output:
+  NAME                       READY   STATUS    RESTARTS   AGE
+  backend-xxxxxxxx-aaaaaa    1/1     Running   0          15m
+  backend-xxxxxxxx-bbbbbb    1/1     Running   0          15m
+  backend-xxxxxxxx-cccccc    1/1     Running   0          15m
+  backend-xxxxxxxx-fffff1    1/1     Running   0          5s    <-- NEW
+  backend-xxxxxxxx-fffff2    1/1     Running   0          5s    <-- NEW
+
+Check endpoints (now 5):
+
+Command:
+  kubectl get endpoints backend-svc
+
+Expected output:
+  backend-svc   10.1.x.11:80,10.1.x.12:80,10.1.x.13:80,10.1.x.18:80,10.1.x.19:80
+
+Now run 10 requests — traffic is spread across 5 pods:
+
+Command (PowerShell):
+  1..10 | ForEach-Object { curl http://localhost:30100/api/ }
+
+Expected output (5 different pod names appearing):
+  Backend Pod: backend-xxxxxxxx-aaaaaa
+  Backend Pod: backend-xxxxxxxx-bbbbbb
+  Backend Pod: backend-xxxxxxxx-cccccc
+  Backend Pod: backend-xxxxxxxx-fffff1
+  Backend Pod: backend-xxxxxxxx-fffff2
+  Backend Pod: backend-xxxxxxxx-aaaaaa
+  Backend Pod: backend-xxxxxxxx-bbbbbb
+  Backend Pod: backend-xxxxxxxx-cccccc
+  Backend Pod: backend-xxxxxxxx-fffff1
+  Backend Pod: backend-xxxxxxxx-fffff2
+
+EXPLANATION TO FACULTY:
+  "I scaled the backend from 3 to 5 pods. The Service automatically detected
+   the 2 new pods and added them to the load balancer. Now traffic is
+   distributed across all 5 pods. No frontend changes needed — the Service
+   name 'backend-svc' still resolves and now includes 5 endpoints."
+
+Scale back to 3:
+
+Command:
+  kubectl scale deployment backend --replicas=3
+
+
+===============================================================================
+ STEP 11: Full Cluster View (For Faculty Demonstration)
+===============================================================================
+
+Show all pods:
+
+Command:
+  kubectl get pods -o wide
+
+Expected output:
+  NAME                        READY  STATUS   IP          NODE
+  backend-xxxx-aaa            1/1    Running   10.1.x.11   docker-desktop
+  backend-xxxx-bbb            1/1    Running   10.1.x.12   docker-desktop
+  backend-xxxx-ccc            1/1    Running   10.1.x.13   docker-desktop
+  frontend-xxxx-ddd           1/1    Running   10.1.x.21   docker-desktop
+  frontend-xxxx-eee           1/1    Running   10.1.x.22   docker-desktop
+
+Show all services:
+
+Command:
+  kubectl get svc
+
+Expected output:
+  NAME           TYPE        CLUSTER-IP     EXTERNAL-IP  PORT(S)        AGE
+  backend-svc    ClusterIP   10.96.x.x     <none>       80/TCP         20m
+  frontend-svc   NodePort    10.96.x.y     <none>       80:30100/TCP   18m
+  kubernetes     ClusterIP   10.96.0.1      <none>       443/TCP        1h
+
+Show all endpoints:
+
+Command:
+  kubectl get endpoints
+
+Expected output:
+  NAME           ENDPOINTS                                       AGE
+  backend-svc    10.1.x.11:80,10.1.x.12:80,10.1.x.13:80          20m
+  frontend-svc   10.1.x.21:80,10.1.x.22:80                       18m
+  kubernetes     192.168.x.x:6443                                 1h
+
+Describe the backend service:
+
+Command:
+  kubectl describe svc backend-svc
+
+Expected output (key fields):
+  Name:        backend-svc
+  Type:        ClusterIP
+  IP:          10.96.x.x
+  Port:        80/TCP
+  TargetPort:  80/TCP
+  Endpoints:   10.1.x.11:80,10.1.x.12:80,10.1.x.13:80
+  Selector:    app=backend
+
+Describe the frontend service:
+
+Command:
+  kubectl describe svc frontend-svc
+
+Expected output (key fields):
+  Name:        frontend-svc
+  Type:        NodePort
+  IP:          10.96.x.y
+  Port:        80/TCP
+  TargetPort:  80/TCP
+  NodePort:    30100/TCP
+  Endpoints:   10.1.x.21:80,10.1.x.22:80
+  Selector:    app=frontend
+
+
+===============================================================================
+ STEP 12: Clean Up (Delete All Resources)
+===============================================================================
+
+Delete by file:
+
+Command:
+  kubectl delete -f k8s-final-demo/frontend-service.yaml
+  kubectl delete -f k8s-final-demo/frontend-deployment.yaml
+  kubectl delete -f k8s-final-demo/backend-service.yaml
+  kubectl delete -f k8s-final-demo/backend-deployment.yaml
+
+Or delete by name:
+
+Command:
+  kubectl delete svc frontend-svc backend-svc
+  kubectl delete deployment frontend backend
+
+Verify cleanup:
+
+Command:
+  kubectl get all
+
+Expected output:
+  No resources found in default namespace.
+
+
+===============================================================================
+ SUMMARY: How This Demo Proves the Two Core Concepts
+===============================================================================
+
+  CONCEPT 1: SERVICE DISCOVERY
+  ---------------------------------------------------------------
+  What happened:
+    The frontend pod needed to call the backend. It used the name
+    "backend-svc" in its Nginx config: proxy_pass http://backend-svc:80/
+
+    The frontend pod did NOT know:
+      - Any backend pod IP (they change when pods are recreated)
+      - The backend Service's ClusterIP (it is assigned dynamically)
+
+    How it worked:
+      1. Frontend Nginx tries to connect to "backend-svc:80"
+      2. Kubernetes CoreDNS resolves "backend-svc" → 10.96.x.x (ClusterIP)
+      3. The request reaches the backend Service
+      4. The Service forwards it to one of the 3 backend pods
+
+    Why this matters:
+      If backend pods are recreated, deleted, or scaled, the frontend
+      config NEVER needs to change. "backend-svc" always resolves to
+      the current Service IP. This is the power of service discovery —
+      decouple services by name, not by address.
+
+
+  CONCEPT 2: LOAD BALANCING
+  ---------------------------------------------------------------
+  What happened:
+    The backend had 3 replicas. Each request to the backend returned
+    a different pod name, proving that traffic was distributed.
+
+    How it worked:
+      1. Request arrives at the backend Service (ClusterIP)
+      2. The Service has 3 endpoints (3 pod IPs)
+      3. The Service picks one endpoint using round-robin
+      4. The request is forwarded to that pod
+      5. Next request goes to the next pod (round-robin)
+
+    What we observed:
+      - Request 1 → "Backend Pod: backend-xxxx-aaa"
+      - Request 2 → "Backend Pod: backend-xxxx-bbb"
+      - Request 3 → "Backend Pod: backend-xxxx-ccc"
+      - Request 4 → "Backend Pod: backend-xxxx-aaa" (back to start)
+      - Pattern repeats in round-robin
+
+    When we scaled to 5:
+      - Traffic was distributed across 5 pods instead of 3
+      - The Service automatically included the new pods
+
+    Why this matters:
+      If one backend pod is slow or fails, traffic still goes to the
+      other pods. The application stays available. Adding more pods
+      increases capacity without any configuration changes.
+
+
+===============================================================================
+ ARCHITECTURE DIAGRAM (Draw This for Faculty)
+===============================================================================
+
+  Browser (http://localhost:30100)
+    |
+    | NodePort 30100
+    v
+  +---------------------------+
+  | frontend-svc (NodePort)   |
+  | ClusterIP: 10.96.x.y     |
+  | Externally: localhost:30100
+  +---------------------------+
+    |
+    | Load balances across
+    v
+  +--------------+  +--------------+
+  | frontend     |  | frontend     |
+  | Pod 1        |  | Pod 2        |
+  | (Nginx)      |  | (Nginx)      |
+  | Serves HTML  |  | Serves HTML  |
+  | Proxies /api/|  | Proxies /api/|
+  +--------------+  +--------------+
+    |                   |
+    | Both proxy to     |
+    | "backend-svc"     |  <-- SERVICE DISCOVERY (DNS name, not IP)
+    v                   v
+  +---------------------------+
+  | backend-svc (ClusterIP)  |
+  | ClusterIP: 10.96.x.x    |
+  | Internal only (no external access)
+  +---------------------------+
+    |        |        |
+    | round  | round  | round     <-- LOAD BALANCING
+    | robin   | robin  | robin
+    v        v        v
+  +--------+ +--------+ +--------+
+  |backend | |backend | |backend |
+  | Pod 1  | | Pod 2  | | Pod 3  |
+  | Nginx  | | Nginx  | | Nginx  |
+  |"Pod 1" | |"Pod 2" | |"Pod 3" |
+  +--------+ +--------+ +--------+
+
+
+===============================================================================
+ FACULTY VIVA Q&A
+===============================================================================
+
+Q1: What is service discovery in this demo?
+A:  The frontend pod calls the backend using the DNS name "backend-svc"
+    instead of an IP address. Kubernetes CoreDNS automatically resolves
+    this name to the backend Service's ClusterIP. The frontend never
+    needs to know the actual pod IPs, which change when pods are
+    recreated. This is service discovery — finding services by name.
+
+Q2: How is load balancing demonstrated in this demo?
+A:  The backend runs 3 replicas. When the frontend sends requests to
+    "backend-svc", the Service distributes them across all 3 pods using
+    round-robin. Each response shows a different pod name, proving
+    that different pods handled different requests.
+
+Q3: Why is the backend Service ClusterIP but the frontend is NodePort?
+A:  The backend should only be accessible from inside the cluster (by
+    the frontend). ClusterIP provides internal-only access. The frontend
+    needs to be accessed by the user's browser, so it uses NodePort to
+    expose port 30100 externally. This follows least-privilege exposure.
+
+Q4: What happens if a backend pod crashes?
+A:  Kubernetes removes the crashed pod from the Service endpoints and
+    creates a replacement. The frontend continues calling "backend-svc"
+    with no changes. Traffic is routed only to healthy pods. This is
+    self-healing combined with service discovery.
+
+Q5: What happens if you scale the backend to 5 replicas?
+A:  The Service automatically detects the 2 new pods and adds them as
+    endpoints. Traffic is now distributed across 5 pods instead of 3.
+    No frontend configuration changes are needed — the Service name
+    stays the same, only the endpoints behind it change.
+
+Q6: Why did we embed the Nginx config in the deployment YAML?
+A:  For simplicity. In a real project, we would build a custom Docker
+    image with the config baked in, or use a ConfigMap to inject it.
+    Embedding it in the command/args keeps everything in one file for
+    the demo, making it easy to follow and explain.
+
+Q7: What is the role of the Endpoints object?
+A:  The Endpoints object is automatically maintained by Kubernetes. It
+    lists every pod IP that matches the Service's label selector. When
+    a request arrives at the Service, it picks an endpoint (pod IP) from
+    this list using round-robin. When pods are created or deleted, the
+    Endpoints are updated automatically.
+
+Q8: How does Kubernetes DNS work for services?
+A:  Every Service gets a DNS record: <service-name>.<namespace>.svc.cluster.local
+    For our backend: backend-svc.default.svc.cluster.local
+    Pods can use the short name "backend-svc" (same namespace), or the
+    full name. CoreDNS (running as a pod in kube-system namespace)
+    handles the resolution and returns the Service's ClusterIP.

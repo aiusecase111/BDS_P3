@@ -1,0 +1,71 @@
+web-deployment.yaml
+----------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-deployment
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+      - name: web
+        image: nginx:alpine
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          echo "Hello from Kubernetes Pod: $(hostname)" > /usr/share/nginx/html/index.html
+          nginx -g 'daemon off;'
+        ports:
+        - containerPort: 80
+
+-----------------------------------------------
+web-service.yaml
+-------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-service
+spec:
+  type: ClusterIP
+  selector:
+    app: web
+  ports:
+  - port: 80
+    targetPort: 80
+========================================
+
+
+
+
+kubectl version --client
+kubectl cluster-info
+kubectl get nodes
+================================
+
+kubectl apply -f web-deployment.yaml
+kubectl get pods -l app=web
+
+
+==================
+kubectl apply -f web-service.yaml
+kubectl get services
+kubectl get services web-service
+
+=================
+kubectl get endpoints web-service
+kubectl run client --image=busybox:1.36 --restart=Never -- sleep 3600
+kubectl get pod client
+kubectl exec -it client -- sh
+    nslookup web-service
+    wget -qO- http://web-service
+
+=====================
+kubectl exec client -- sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do wget -qO- http://web-service; echo; done'
+kubectl scale deployment web-deployment --replicas=5
